@@ -1,8 +1,14 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { GameRuleError, createInitialState, GAME_VERSION } from './engine.js';
+import { migrateStoredState, SaveVersionError } from './migrations.js';
 
 const VALID_PHASES = new Set(['planning', 'completed', 'failed']);
+
+// 损坏备份与界面恢复提示共用同一条文案，保证服务端日志、备份文件与玩家看到的信息一致。
+export function buildRecoveryNotice(backupName, errorMessage) {
+  return `存档无法读取，已备份为 ${backupName}，并已开始新一局：${errorMessage}`;
+}
 
 function isPlainObject(value) {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
@@ -71,6 +77,7 @@ function hasValidStateShape(state) {
   if (!Number.isFinite(state.credits) || state.credits < 0) return false;
   if (!Number.isInteger(state.streak) || state.streak < 0) return false;
   if (!Number.isInteger(state.revision) || state.revision < 0) return false;
+  if (!Number.isFinite(state.totalDistance) || state.totalDistance < 0) return false;
   if (!Array.isArray(state.islands) || !Array.isArray(state.couriers)) return false;
   if (!Array.isArray(state.letters) || !Array.isArray(state.history)) return false;
   if (!isPlainObject(state.wind) || !isPlainObject(state.relations)) return false;
@@ -118,7 +125,8 @@ function hasValidStateShape(state) {
     Number.isInteger(letter.deadlineHour) &&
     typeof letter.sender === 'string' &&
     typeof letter.subject === 'string' &&
-    ['inbox', 'backlog', 'delivered'].includes(letter.status)
+    ['inbox', 'backlog', 'delivered'].includes(letter.status) &&
+    (letter.lastPenaltyDay === null || Number.isInteger(letter.lastPenaltyDay))
   ))) return false;
 
   if (!Number.isInteger(state.wind.directionIndex) || state.wind.directionIndex < 0 || state.wind.directionIndex > 7) return false;
@@ -157,6 +165,10 @@ function normalizeStoredState(parsed) {
   }
   if (Number.isFinite(parsed.credits) && parsed.credits < 0) {
     parsed.credits = 0;
+    changed = true;
+  }
+  if (!Number.isFinite(parsed.totalDistance) || parsed.totalDistance < 0) {
+    parsed.totalDistance = 0;
     changed = true;
   }
   if (isPlainObject(parsed.relations)) {
@@ -201,18 +213,28 @@ export class GameStore {
     let needsSave = false;
     try {
       parsed = JSON.parse(rawState);
+      // 版本闸门：来自新版本或已停止支持的旧版本时硬拒绝，不移动也不覆盖原文件。
+      // 迁移在内存对象上进行；只有迁移、归一化、结构校验全部通过后才允许写盘。
+      const migration = migrateStoredState(parsed);
+      parsed = migration.state;
+      needsSave = migration.migrated;
       const normalized = normalizeStoredState(parsed);
       parsed = normalized.state;
-      needsSave = normalized.changed;
+      needsSave = needsSave || normalized.changed;
       if (!hasValidStateShape(parsed)) {
-        throw new Error('存档结构不完整或版本不受支持');
+        throw new Error('存档结构不完整或字段不符合当前版本要求');
       }
     } catch (error) {
+      if (error instanceof SaveVersionError) {
+        this.state = null;
+        throw error;
+      }
       return this.recoverCorruptState(error);
     }
 
     this.state = parsed;
     this.recovery = null;
+    // 迁移补齐或归一化后写回；save 为临时文件 + 原子 rename，失败不会留下半份存档。
     if (needsSave) this.save();
     return this.getState();
   }
@@ -225,11 +247,12 @@ export class GameStore {
       suffix += 1;
     }
 
+    // 先把原档整体改名保留，再写新档，任何情况下都不会用新数据覆盖原始字节。
     fs.renameSync(this.filePath, backupPath);
+    const backupName = path.basename(backupPath);
     const recoveredState = createInitialState(this.options);
-    this.recovery = {
-      reason: `存档无法读取，已备份为 ${path.basename(backupPath)}：${error.message}`
-    };
+    const reason = buildRecoveryNotice(backupName, error.message);
+    this.recovery = { reason };
     try {
       this.state = recoveredState;
       this.save();
@@ -237,6 +260,8 @@ export class GameStore {
       this.state = null;
       throw saveError;
     }
+    // 服务端日志与返回给前端的恢复提示使用同一条文案。
+    this.options.onRecovery?.({ reason, backupPath, error });
     return {
       ...this.getState(),
       recovery: structuredClone(this.recovery)

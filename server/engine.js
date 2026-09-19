@@ -1,4 +1,6 @@
-export const GAME_VERSION = 1;
+export const GAME_VERSION = 2;
+// 低于该版本的存档不再提供迁移路径，直接拒绝加载。
+export const MIN_SUPPORTED_SAVE_VERSION = 1;
 export const HUB_ID = 'skyport';
 
 export const HUB_ISLAND = {
@@ -206,6 +208,7 @@ export function generateLettersForDay(seed, day) {
       sealColor: urgency === 3 ? 'seal-red' : urgency === 2 ? 'seal-amber' : 'seal-blue',
       status: 'inbox',
       backlogSince: null,
+      lastPenaltyDay: null,
       deliveredDay: null,
       deliveredTo: null,
       outcome: null
@@ -251,6 +254,7 @@ export function createInitialState({ seed = Date.now(), days = 14 } = {}) {
     credits: 80,
     streak: 0,
     revision: 0,
+    totalDistance: 0,
     wind: generateWind(normalizedSeed, 1),
     islands: [structuredClone(HUB_ISLAND), ...structuredClone(ISLANDS)],
     couriers: structuredClone(COURIERS),
@@ -600,6 +604,9 @@ export function advanceDay(state, rawAssignments = []) {
 
   const hadProblem = preview.projection.wrong > 0 || preview.projection.late > 0 || preview.projection.backlog > 0;
   state.streak = hadProblem ? 0 : state.streak + 1;
+
+  const dispatchedDistance = round(preview.routes.reduce((sum, route) => sum + route.totalDistance, 0), 1);
+  state.totalDistance = round((Number.isFinite(state.totalDistance) ? state.totalDistance : 0) + dispatchedDistance, 1);
 
   const report = {
     day: state.day,

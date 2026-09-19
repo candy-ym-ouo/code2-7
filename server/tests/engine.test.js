@@ -162,6 +162,27 @@ test('每次结算都会递增用于防重复提交的版本号', () => {
   assert.equal(state.revision, 2);
 });
 
+test('结算会累加本局累计航程且为空方案时保持为零', () => {
+  const emptyState = createInitialState({ seed: 'distance-empty' });
+  advanceDay(emptyState, []);
+  assert.equal(emptyState.totalDistance, 0);
+
+  const state = createInitialState({ seed: 'distance-run' });
+  const letter = state.letters[0];
+  const assignments = [{
+    letterId: letter.id,
+    courierId: 'comet',
+    targetIslandId: letter.recipientIslandId,
+    order: 0
+  }];
+  const report = advanceDay(state, assignments);
+  const expectedDistance = Math.round(
+    report.routes.reduce((sum, route) => sum + route.totalDistance, 0) * 10
+  ) / 10;
+  assert.ok(expectedDistance > 0);
+  assert.equal(state.totalDistance, expectedDistance);
+});
+
 test('信誉在 0 到 100 之间封顶，并正确报告实际变化', () => {
   const state = createInitialState({ seed: 'reputation-cap' });
   state.reputation = 99;

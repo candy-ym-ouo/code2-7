@@ -23,7 +23,7 @@ function App() {
       .then(({ state }) => {
         if (!active) return;
         setGame(state);
-        if (state.recovery?.reason) setError(`存档已恢复：${state.recovery.reason}`);
+        if (state.recovery?.reason) setError(state.recovery.reason);
         if (state.lastReport && state.phase !== 'planning') setReport(state.lastReport);
       })
       .catch((requestError) => active && setError(requestError.message))
@@ -225,6 +225,11 @@ function App() {
             <span>连续无差错</span>
             <strong>{game.streak}</strong>
             <small>日</small>
+          </div>
+          <div className="metric compact-metric">
+            <span>累计航程</span>
+            <strong>{Math.round(game.totalDistance || 0)}</strong>
+            <small>公里</small>
           </div>
         </div>
 

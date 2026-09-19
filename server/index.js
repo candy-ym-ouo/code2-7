@@ -2,6 +2,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createApp } from './app.js';
 import { GameStore } from './store.js';
+import { SaveVersionError } from './migrations.js';
 
 const currentDirectory = path.dirname(fileURLToPath(import.meta.url));
 const rootDirectory = path.resolve(currentDirectory, '..');
@@ -13,8 +14,26 @@ if (!Number.isInteger(port) || port < 1 || port > 65535) {
 const isProduction = process.env.NODE_ENV === 'production' || process.env.npm_lifecycle_event === 'start';
 const dataFile = process.env.DATA_FILE || path.join(currentDirectory, 'data', 'game-state.json');
 const clientDist = path.join(rootDirectory, 'dist');
-const store = new GameStore(dataFile, { days: 14 });
-const initialState = store.load();
+const store = new GameStore(dataFile, {
+  days: 14,
+  // 存档损坏恢复时，服务端日志输出与玩家在界面看到的完全相同的提示。
+  onRecovery: ({ reason, backupPath }) => {
+    console.warn(`[浮空岛邮政署] ${reason}（备份路径：${backupPath}）`);
+  }
+});
+
+let initialState;
+try {
+  initialState = store.load();
+} catch (error) {
+  if (error instanceof SaveVersionError) {
+    // 版本拒绝：原存档未被移动或覆盖，提示玩家处理后再启动。
+    console.error(`[浮空岛邮政署] ${error.message}`);
+  } else {
+    console.error('[浮空岛邮政署] 存档加载失败，服务未启动，原文件保持不变：', error);
+  }
+  process.exit(1);
+}
 
 const app = createApp({ store, clientDist });
 const server = app.listen(port, () => {
