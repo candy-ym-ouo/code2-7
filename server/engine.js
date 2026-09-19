@@ -1,4 +1,5 @@
-export const GAME_VERSION = 1;
+export const GAME_VERSION = 2;
+export const MIN_SUPPORTED_SAVE_VERSION = 1;
 export const HUB_ID = 'skyport';
 
 export const HUB_ISLAND = {
@@ -251,6 +252,7 @@ export function createInitialState({ seed = Date.now(), days = 14 } = {}) {
     credits: 80,
     streak: 0,
     revision: 0,
+    stats: createEmptyStats(),
     wind: generateWind(normalizedSeed, 1),
     islands: [structuredClone(HUB_ISLAND), ...structuredClone(ISLANDS)],
     couriers: structuredClone(COURIERS),
@@ -262,6 +264,76 @@ export function createInitialState({ seed = Date.now(), days = 14 } = {}) {
     createdAt: now,
     updatedAt: now
   };
+}
+
+export function createEmptyStats() {
+  return {
+    totalDelivered: 0,
+    totalOnTime: 0,
+    totalLate: 0,
+    totalWrong: 0,
+    totalBacklog: 0
+  };
+}
+
+function isValidLiveStats(stats) {
+  return stats !== null && typeof stats === 'object' && !Array.isArray(stats)
+    && Object.keys(createEmptyStats()).every((field) => Number.isInteger(stats[field]) && stats[field] >= 0);
+}
+
+const STATE_MIGRATORS = {
+  // v1 -> v2：新增整局累计统计 stats，旧档可由 history 回填后继续游玩。
+  2(state) {
+    const history = Array.isArray(state.history) ? state.history : [];
+    const summarize = (field) => history.reduce(
+      (sum, entry) => sum + (Number.isInteger(entry?.[field]) && entry[field] > 0 ? entry[field] : 0),
+      0
+    );
+    state.stats = {
+      totalDelivered: summarize('delivered'),
+      totalOnTime: summarize('onTime'),
+      totalLate: summarize('late'),
+      totalWrong: summarize('wrong'),
+      totalBacklog: summarize('backlog')
+    };
+  }
+};
+
+export class StateMigrationError extends Error {
+  constructor(message, { fromVersion, toVersion } = {}) {
+    super(message);
+    this.name = 'StateMigrationError';
+    this.fromVersion = fromVersion;
+    this.toVersion = toVersion;
+  }
+}
+
+// 按版本顺序逐个执行迁移；迁移只修改传入的内存对象，不触碰磁盘文件。
+export function migrateState(state, migrators) {
+  const resolvedMigrators = migrators ?? STATE_MIGRATORS;
+  let version = state.version;
+  while (version < GAME_VERSION) {
+    const nextVersion = version + 1;
+    const migrate = resolvedMigrators[nextVersion];
+    if (typeof migrate !== 'function') {
+      throw new StateMigrationError(
+        `存档版本 ${version} 无法迁移到 ${nextVersion}，缺少对应的迁移方案。`,
+        { fromVersion: version, toVersion: nextVersion }
+      );
+    }
+    try {
+      migrate(state);
+    } catch (error) {
+      if (error instanceof StateMigrationError) throw error;
+      throw new StateMigrationError(
+        `存档从版本 ${version} 迁移到 ${nextVersion} 时失败：${error.message}`,
+        { fromVersion: version, toVersion: nextVersion }
+      );
+    }
+    version = nextVersion;
+    state.version = version;
+  }
+  return state;
 }
 
 export function normalizeAssignments(assignments = []) {
@@ -626,6 +698,15 @@ export function advanceDay(state, rawAssignments = []) {
     wrong: preview.projection.wrong,
     backlog: unassignedLetters.length
   });
+
+  if (!isValidLiveStats(state.stats)) {
+    state.stats = createEmptyStats();
+  }
+  state.stats.totalDelivered += assignedIds.size;
+  state.stats.totalOnTime += preview.projection.onTime;
+  state.stats.totalLate += preview.projection.late;
+  state.stats.totalWrong += preview.projection.wrong;
+  state.stats.totalBacklog += unassignedLetters.length;
 
   state.lastReport = report;
 

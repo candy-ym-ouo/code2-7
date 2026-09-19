@@ -1,11 +1,33 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { GameRuleError, createInitialState, GAME_VERSION } from './engine.js';
+import {
+  GameRuleError,
+  createInitialState,
+  GAME_VERSION,
+  MIN_SUPPORTED_SAVE_VERSION,
+  migrateState
+} from './engine.js';
+
+export class SaveRejectedError extends Error {
+  constructor(message, { code, saveVersion } = {}) {
+    super(message);
+    this.name = 'SaveRejectedError';
+    this.code = code;
+    this.saveVersion = saveVersion;
+  }
+}
 
 const VALID_PHASES = new Set(['planning', 'completed', 'failed']);
 
 function isPlainObject(value) {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+function hasValidStats(stats) {
+  return isPlainObject(stats)
+    && ['totalDelivered', 'totalOnTime', 'totalLate', 'totalWrong', 'totalBacklog'].every(
+      (field) => Number.isInteger(stats[field]) && stats[field] >= 0
+    );
 }
 
 function hasUniqueIds(items) {
@@ -60,9 +82,9 @@ function hasValidEnding(ending) {
   );
 }
 
-function hasValidStateShape(state) {
+function hasValidStateShape(state, expectedVersion = state.version) {
   if (!isPlainObject(state)) return false;
-  if (state.version !== GAME_VERSION) return false;
+  if (!Number.isInteger(state.version) || state.version !== expectedVersion) return false;
   if (typeof state.seed !== 'string') return false;
   if (!Number.isInteger(state.day) || !Number.isInteger(state.days)) return false;
   if (state.day < 1 || state.days < 1 || state.day > state.days) return false;
@@ -71,6 +93,7 @@ function hasValidStateShape(state) {
   if (!Number.isFinite(state.credits) || state.credits < 0) return false;
   if (!Number.isInteger(state.streak) || state.streak < 0) return false;
   if (!Number.isInteger(state.revision) || state.revision < 0) return false;
+  if (expectedVersion >= 2 && !hasValidStats(state.stats)) return false;
   if (!Array.isArray(state.islands) || !Array.isArray(state.couriers)) return false;
   if (!Array.isArray(state.letters) || !Array.isArray(state.history)) return false;
   if (!isPlainObject(state.wind) || !isPlainObject(state.relations)) return false;
@@ -139,7 +162,7 @@ function hasValidStateShape(state) {
 }
 
 function normalizeStoredState(parsed) {
-  if (!isPlainObject(parsed) || parsed.version !== GAME_VERSION) {
+  if (!isPlainObject(parsed)) {
     return { state: parsed, changed: false };
   }
 
@@ -176,6 +199,7 @@ export class GameStore {
   constructor(filePath, options = {}) {
     this.filePath = filePath;
     this.options = options;
+    this.migrators = options.migrators;
     this.state = null;
     this.recovery = null;
   }
@@ -198,26 +222,78 @@ export class GameStore {
 
     const rawState = fs.readFileSync(this.filePath, 'utf8');
     let parsed;
-    let needsSave = false;
+    let sourceVersion;
     try {
       parsed = JSON.parse(rawState);
-      const normalized = normalizeStoredState(parsed);
-      parsed = normalized.state;
-      needsSave = normalized.changed;
-      if (!hasValidStateShape(parsed)) {
-        throw new Error('存档结构不完整或版本不受支持');
+      if (!isPlainObject(parsed) || !Number.isInteger(parsed.version)) {
+        throw new Error('存档结构不完整：缺少有效的版本号');
       }
+      sourceVersion = parsed.version;
+
+      // 版本拒绝策略：过新或过旧的存档一律拒绝，且不改动原文件。
+      if (sourceVersion > GAME_VERSION) {
+        throw new SaveRejectedError(
+          `存档版本 ${sourceVersion} 来自更新的游戏版本，当前版本仅支持 v${GAME_VERSION} 及以下，请升级游戏后再读取。`,
+          { code: 'SAVE_VERSION_NEWER', saveVersion: sourceVersion }
+        );
+      }
+      if (sourceVersion < MIN_SUPPORTED_SAVE_VERSION) {
+        throw new SaveRejectedError(
+          `存档版本 ${sourceVersion} 已不再受支持（最低支持 v${MIN_SUPPORTED_SAVE_VERSION}），无法继续迁移。`,
+          { code: 'SAVE_VERSION_TOO_OLD', saveVersion: sourceVersion }
+        );
+      }
+
+      // 先修正越界数值等可自愈字段，再做结构校验（损坏与可迁移问题分开处理）。
+      const preNormalized = normalizeStoredState(parsed);
+      parsed = preNormalized.state;
+      let needsSave = preNormalized.changed;
+
+      // 迁移前先核对旧版本结构：结构损坏的旧档走损坏恢复，而非版本迁移。
+      if (!hasValidStateShape(parsed, sourceVersion)) {
+        throw new Error('存档结构不完整或字段损坏');
+      }
+
+      // 迁移、归一化与校验全部包在同一层 try 中：任何一步失败都拒绝加载，原文件不动。
+      let migrated = parsed;
+      try {
+        if (sourceVersion < GAME_VERSION) {
+          migrated = migrateState(parsed, this.migrators);
+        }
+        const normalized = normalizeStoredState(migrated);
+        migrated = normalized.state;
+        needsSave = needsSave || normalized.changed || sourceVersion < GAME_VERSION;
+        if (!hasValidStateShape(migrated, GAME_VERSION)) {
+          throw new Error('迁移后的存档结构校验未通过');
+        }
+      } catch (migrationError) {
+        const message = migrationError instanceof SaveRejectedError
+          ? migrationError.message
+          : `存档从 v${sourceVersion} 迁移到 v${GAME_VERSION} 失败：${migrationError.message}，原文件未被修改。`;
+        throw new SaveRejectedError(message, { code: 'SAVE_MIGRATION_FAILED', saveVersion: sourceVersion });
+      }
+
+      parsed = migrated;
+
+      // 迁移与校验均在内存中完成，通过后才落盘；任何失败都不会覆盖原文件。
+      this.state = parsed;
+      this.recovery = null;
+      if (needsSave) this.save();
     } catch (error) {
-      return this.recoverCorruptState(error);
+      if (error instanceof SaveRejectedError) {
+        this.state = null;
+        throw error;
+      }
+      if (error instanceof SyntaxError) {
+        error = new Error(`存档不是有效的 JSON：${error.message}`);
+      }
+      return this.recoverCorruptState(error, sourceVersion);
     }
 
-    this.state = parsed;
-    this.recovery = null;
-    if (needsSave) this.save();
     return this.getState();
   }
 
-  recoverCorruptState(error) {
+  recoverCorruptState(error, sourceVersion) {
     let backupPath = `${this.filePath}.corrupt-${Date.now()}`;
     let suffix = 1;
     while (fs.existsSync(backupPath)) {
@@ -225,18 +301,43 @@ export class GameStore {
       suffix += 1;
     }
 
-    fs.renameSync(this.filePath, backupPath);
+    const backupName = path.basename(backupPath);
+    let renameError = null;
+    try {
+      fs.renameSync(this.filePath, backupPath);
+    } catch (errorOnRename) {
+      renameError = errorOnRename;
+    }
+
+    // 备份失败（如权限问题）时绝不能覆盖原文件：保留现场并直接报错。
+    if (renameError) {
+      this.state = null;
+      throw new Error(`存档无法读取，且备份失败，原文件已保留：${renameError.message}。原始问题：${error.message}`);
+    }
+
+    // 统一的损坏备份与恢复提示：服务端日志与前端弹窗使用同一条文案。
+    const versionLabel = Number.isInteger(sourceVersion) ? `v${sourceVersion} ` : '';
+    const reason = `${versionLabel}存档无法读取，原文件已备份为 ${backupName}（${error.message}），已为你开启新一局。`;
+
     const recoveredState = createInitialState(this.options);
-    this.recovery = {
-      reason: `存档无法读取，已备份为 ${path.basename(backupPath)}：${error.message}`
-    };
     try {
       this.state = recoveredState;
       this.save();
     } catch (saveError) {
+      // 新档写入失败时把原档移回，保证提示与实际结果一致。
+      try {
+        fs.renameSync(backupPath, this.filePath);
+      } catch (rollbackError) {
+        this.state = null;
+        throw new Error(
+          `存档损坏且恢复失败：新档未能写入（${saveError.message}），原档备份也无法移回（${rollbackError.message}），备份位于 ${backupName}。`
+        );
+      }
       this.state = null;
-      throw saveError;
+      throw new Error(`存档无法读取（${error.message}），新档写入失败（${saveError.message}），原文件已还原。`);
     }
+
+    this.recovery = { reason };
     return {
       ...this.getState(),
       recovery: structuredClone(this.recovery)

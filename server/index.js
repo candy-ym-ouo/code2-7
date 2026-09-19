@@ -14,7 +14,20 @@ const isProduction = process.env.NODE_ENV === 'production' || process.env.npm_li
 const dataFile = process.env.DATA_FILE || path.join(currentDirectory, 'data', 'game-state.json');
 const clientDist = path.join(rootDirectory, 'dist');
 const store = new GameStore(dataFile, { days: 14 });
-const initialState = store.load();
+
+let initialState;
+try {
+  initialState = store.load();
+} catch (error) {
+  console.error(`[浮空岛邮政署] ${error.message}`);
+  console.error('[浮空岛邮政署] 原存档文件未被修改，请处理后重启服务。');
+  process.exit(1);
+}
+
+const recovery = store.getRecovery();
+if (recovery) {
+  console.warn(`[浮空岛邮政署] ${recovery.reason}`);
+}
 
 const app = createApp({ store, clientDist });
 const server = app.listen(port, () => {

@@ -4,7 +4,8 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { createApp } from '../app.js';
-import { GameStore } from '../store.js';
+import { GameStore, SaveRejectedError } from '../store.js';
+import { advanceDay, GAME_VERSION, MIN_SUPPORTED_SAVE_VERSION, migrateState } from '../engine.js';
 
 test('HTTP API 完成读取、预览、结算和重置闭环', async (context) => {
   const temporaryDirectory = fs.mkdtempSync(path.join(os.tmpdir(), 'sky-post-api-'));
@@ -175,5 +176,156 @@ test('旧存档中的越界状态会在加载时迁移并写回', () => {
   assert.equal(migrated.credits, 0);
   assert.equal(migrated.relations['gale:sun'], 100);
   assert.deepEqual(persisted, migrated);
+  fs.rmSync(temporaryDirectory, { recursive: true, force: true });
+});
+
+function loadV1Save(dataFile) {
+  const state = new GameStore(`${dataFile}.seed`, { seed: 'v1-save-seed' }).load();
+  const v1 = structuredClone(state);
+  v1.version = 1;
+  delete v1.stats;
+  // 同时构造一段历史，用于验证 stats 回填。
+  v1.history.push({
+    day: 1,
+    reputationDelta: 3,
+    creditsDelta: 18,
+    delivered: 2,
+    onTime: 1,
+    late: 1,
+    wrong: 0,
+    backlog: 1
+  });
+  fs.writeFileSync(dataFile, JSON.stringify(v1), 'utf8');
+  return v1;
+}
+
+test('旧版本存档补齐新字段后可继续游玩并升级到当前版本', () => {
+  const temporaryDirectory = fs.mkdtempSync(path.join(os.tmpdir(), 'sky-post-v1-upgrade-'));
+  const dataFile = path.join(temporaryDirectory, 'state.json');
+  loadV1Save(dataFile);
+
+  const store = new GameStore(dataFile, { seed: 'ignored' });
+  const migrated = store.load();
+
+  assert.equal(migrated.version, GAME_VERSION);
+  assert.deepEqual(migrated.stats, {
+    totalDelivered: 2,
+    totalOnTime: 1,
+    totalLate: 1,
+    totalWrong: 0,
+    totalBacklog: 1
+  });
+  assert.equal(store.getRecovery(), null);
+
+  // 旧档进度仍在，可以继续结算。
+  assert.equal(migrated.phase, 'planning');
+  const report = store.mutate((state) => advanceDay(state, []));
+  assert.equal(report.day, 1);
+  const after = store.getState();
+  assert.equal(after.version, GAME_VERSION);
+  assert.ok(after.stats.totalBacklog >= 1);
+
+  // 迁移结果已原子写回磁盘。
+  const persisted = JSON.parse(fs.readFileSync(dataFile, 'utf8'));
+  assert.equal(persisted.version, GAME_VERSION);
+  assert.ok(persisted.stats);
+  fs.rmSync(temporaryDirectory, { recursive: true, force: true });
+});
+
+function require_advanceDay() {
+  // 延迟引用以保持文件顶部导入简洁。
+  return { advanceDay: globalThis.__advanceDay ?? null };
+}
+
+test('来自更高版本的存档会被拒绝且原文件保持不变', () => {
+  const temporaryDirectory = fs.mkdtempSync(path.join(os.tmpdir(), 'sky-post-newer-version-'));
+  const dataFile = path.join(temporaryDirectory, 'state.json');
+  const state = new GameStore(path.join(temporaryDirectory, 'seed.json'), { seed: 'future' }).load();
+  state.version = GAME_VERSION + 1;
+  fs.writeFileSync(dataFile, JSON.stringify(state), 'utf8');
+  const originalContent = fs.readFileSync(dataFile, 'utf8');
+
+  const store = new GameStore(dataFile, { seed: 'ignored' });
+  assert.throws(() => store.load(), (error) => {
+    assert.ok(error instanceof SaveRejectedError);
+    assert.equal(error.code, 'SAVE_VERSION_NEWER');
+    assert.match(error.message, /更新的游戏版本/);
+    return true;
+  });
+  assert.equal(store.getRecovery(), null);
+  assert.equal(fs.readFileSync(dataFile, 'utf8'), originalContent);
+  assert.equal(fs.readdirSync(temporaryDirectory).filter((name) => name.includes('.corrupt-')).length, 0);
+  fs.rmSync(temporaryDirectory, { recursive: true, force: true });
+});
+
+test('低于最低支持版本的存档会被拒绝且原文件保持不变', () => {
+  const temporaryDirectory = fs.mkdtempSync(path.join(os.tmpdir(), 'sky-post-older-version-'));
+  const dataFile = path.join(temporaryDirectory, 'state.json');
+  const state = new GameStore(path.join(temporaryDirectory, 'seed.json'), { seed: 'ancient' }).load();
+  state.version = MIN_SUPPORTED_SAVE_VERSION - 1;
+  delete state.stats;
+  fs.writeFileSync(dataFile, JSON.stringify(state), 'utf8');
+  const originalContent = fs.readFileSync(dataFile, 'utf8');
+
+  const store = new GameStore(dataFile, { seed: 'ignored' });
+  assert.throws(() => store.load(), (error) => {
+    assert.ok(error instanceof SaveRejectedError);
+    assert.equal(error.code, 'SAVE_VERSION_TOO_OLD');
+    assert.match(error.message, /不再受支持/);
+    return true;
+  });
+  assert.equal(fs.readFileSync(dataFile, 'utf8'), originalContent);
+  assert.equal(fs.readdirSync(temporaryDirectory).filter((name) => name.includes('.corrupt-')).length, 0);
+  fs.rmSync(temporaryDirectory, { recursive: true, force: true });
+});
+
+test('迁移失败时不得覆盖或移动原文件', () => {
+  const temporaryDirectory = fs.mkdtempSync(path.join(os.tmpdir(), 'sky-post-migration-fail-'));
+  const dataFile = path.join(temporaryDirectory, 'state.json');
+  loadV1Save(dataFile);
+  const originalContent = fs.readFileSync(dataFile, 'utf8');
+
+  // 注入一个必然失败的 v2 迁移器。
+  const store = new GameStore(dataFile, {
+    seed: 'ignored',
+    migrators: {
+      2() {
+        throw new Error('模拟迁移失败');
+      }
+    }
+  });
+
+  assert.throws(() => store.load(), (error) => {
+    assert.ok(error instanceof SaveRejectedError);
+    assert.equal(error.code, 'SAVE_MIGRATION_FAILED');
+    assert.match(error.message, /迁移失败/);
+    assert.match(error.message, /原文件未被修改/);
+    return true;
+  });
+  assert.equal(fs.readFileSync(dataFile, 'utf8'), originalContent);
+  assert.equal(fs.readdirSync(temporaryDirectory).filter((name) => name.includes('.corrupt-')).length, 0);
+  fs.rmSync(temporaryDirectory, { recursive: true, force: true });
+});
+
+test('缺少迁移路径时同样拒绝加载并保留原文件', () => {
+  assert.throws(() => migrateState({ version: GAME_VERSION - 1 }, {}), /缺少对应的迁移方案/);
+});
+
+test('损坏备份与恢复提示包含统一的备份文件名和原因', () => {
+  const temporaryDirectory = fs.mkdtempSync(path.join(os.tmpdir(), 'sky-post-recovery-msg-'));
+  const dataFile = path.join(temporaryDirectory, 'state.json');
+  fs.writeFileSync(dataFile, '{ not valid json', 'utf8');
+
+  const store = new GameStore(dataFile, { seed: 'recovery-msg' });
+  const recovered = store.load();
+  const backups = fs.readdirSync(temporaryDirectory).filter((name) => name.includes('.corrupt-'));
+  const recovery = store.getRecovery();
+
+  assert.equal(backups.length, 1);
+  assert.ok(recovery);
+  assert.equal(recovery.reason, recovered.recovery.reason);
+  assert.match(recovery.reason, new RegExp(backups[0].replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+  assert.match(recovery.reason, /存档无法读取/);
+  assert.match(recovery.reason, /已为你开启新一局/);
   fs.rmSync(temporaryDirectory, { recursive: true, force: true });
 });

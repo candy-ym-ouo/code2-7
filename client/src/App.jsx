@@ -23,7 +23,7 @@ function App() {
       .then(({ state }) => {
         if (!active) return;
         setGame(state);
-        if (state.recovery?.reason) setError(`存档已恢复：${state.recovery.reason}`);
+        if (state.recovery?.reason) setError(state.recovery.reason);
         if (state.lastReport && state.phase !== 'planning') setReport(state.lastReport);
       })
       .catch((requestError) => active && setError(requestError.message))
